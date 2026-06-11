@@ -30,7 +30,7 @@ message(STATUS "VesperaApps – sysroot: ${VESPERA_SYSROOT}")
 # ────────────────────────────────────────────────────────────────
 set(COMMON_C_FLAGS
         "-target x86_64-unknown-linux-gnu -nostdlib -nostdinc \
-     -fno-stack-protector -fPIE -g -O0 -Wall \
+     -fno-stack-protector -fPIE -g -O2 -Wall \
      --sysroot=${VESPERA_SYSROOT} \
      -isystem ${VESPERA_SYSROOT}/usr/include"
 )
@@ -38,7 +38,7 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${COMMON_C_FLAGS}")
 
 set(COMMON_CXX_FLAGS
         "-target x86_64-unknown-linux-gnu -nostdlib -nostdinc -nostdinc++ \
-     -fno-stack-protector -fPIE -g -O0 -Wall \
+     -fno-stack-protector -fPIE -g -O2 -Wall \
      -fno-exceptions -fno-rtti \
      --sysroot=${VESPERA_SYSROOT} \
      -isystem ${VESPERA_SYSROOT}/usr/include \
