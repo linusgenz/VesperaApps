@@ -38,7 +38,7 @@
 #define ASTRA_PATH_MAX 128
 #define ASTRA_NAME_MAX 64
 #define ASTRA_ICON_DIR "/usr/share/icons"
-#define ASTRA_ICON_EXT ".png"
+#define ASTRA_ICON_EXT ".svg"
 
 typedef struct {
     char bin[ASTRA_PATH_MAX];

@@ -16,11 +16,14 @@
 #include <vespera/fflags.h>
 #include <vespera/handles.h>
 
+#include <unit.h>
+
 #include "lauxlib.h"
 #include "lua.h"
 #include "lualib.h"
 #include "luautil.h"
 #include "monteserrat_12.c"
+#include "poll.h"
 #include "window_close_symbolic_16px.h"
 #include "window_maximize_symbolic_16px.h"
 #include "window_minimize_symbolic_16px.h"
@@ -29,6 +32,7 @@
 /* --- Constants & Macros --------------------------------------------------- */
 #define MAX_WINDOWS 16
 #define MICE_BATCH 32
+#define MOUSE_BUF_SIZE 256  /* must be power of two */
 
 // Limits
 #define STR_MAX_PATH 256
@@ -193,6 +197,16 @@ static RealmID realm_id = 0;
 static compositor_state_t g_comp;
 static loaded_cursor_t g_xcursor;
 static bool g_xcursor_ok = false;
+
+/* --- Async Mouse Ring Buffer ---------------------------------------------- */
+typedef struct {
+    mice_event events[MOUSE_BUF_SIZE];
+    uint32_t   head;   /* writer advances head */
+    uint32_t   tail;   /* reader advances tail */
+    ves_mutex_t mtx;
+} mouse_ring_t;
+
+static mouse_ring_t g_mouse_ring;
 
 /* --- Color Helpers -------------------------------------------------------- */
 static uint8_t color_get_a(uint32_t c) {
@@ -1202,12 +1216,46 @@ static void handle_mouse_move(
     }
 }
 
-static bool process_mouse(void) {
-    mice_event events[MICE_BATCH];
-    const ssize_t bytes = read(g_comp.mouse, events, sizeof(events));
-    if (bytes <= 0 || (size_t)bytes < sizeof(mice_event)) return false;
+/* --- Mouse Reader Thread -------------------------------------------------- */
+/*
+ * Runs in its own unit. Blocks on read() so the main loop is never stalled
+ * by /dev/mice. Events are pushed into a power-of-two ring buffer protected
+ * by a mutex. Overflows are silently dropped (head wraps into tail).
+ */
+static void mouse_reader_unit(uint64_t arg) {
+    (void)arg;
+    mice_event ev;
 
-    const size_t count = (size_t)bytes / sizeof(mice_event);
+    while (true) {
+        pollhdl_t pfd = { .hdl = g_comp.mouse, .events = POLLIN };
+        if (poll(&pfd, 1, -1) <= 0) continue;
+
+        const ssize_t n = read(g_comp.mouse, &ev, sizeof(ev));
+        if (n != (ssize_t)sizeof(ev)) continue;
+
+        ves_mutex_lock(&g_mouse_ring.mtx);
+        const uint32_t next = (g_mouse_ring.head + 1u) & (MOUSE_BUF_SIZE - 1u);
+        if (next != g_mouse_ring.tail) {           /* drop on full */
+            g_mouse_ring.events[g_mouse_ring.head] = ev;
+            g_mouse_ring.head = next;
+        }
+        ves_mutex_unlock(&g_mouse_ring.mtx);
+    }
+}
+
+static bool process_mouse(void) {
+    /* Drain ALL pending events from the ring buffer in one locked pass. */
+    mice_event events[MOUSE_BUF_SIZE];
+    size_t count = 0;
+
+    ves_mutex_lock(&g_mouse_ring.mtx);
+    while (g_mouse_ring.tail != g_mouse_ring.head) {
+        events[count++] = g_mouse_ring.events[g_mouse_ring.tail];
+        g_mouse_ring.tail = (g_mouse_ring.tail + 1u) & (MOUSE_BUF_SIZE - 1u);
+    }
+    ves_mutex_unlock(&g_mouse_ring.mtx);
+
+    if (count == 0) return false;
     bool moved = false;
     crep_window_t* coalesced_win = NULL;
     vbus_display_input_event_t coalesced_payload = {0};
@@ -1431,14 +1479,17 @@ int main(int argc, char* argv[]) {
     ioctl(g_comp.fb, FB_IOCTL_CLEAR, &clr);
     ioctl(g_comp.fb, FB_IOCTL_PRESENT, NULL);
 
-    if (vbus_subscribe(VBUS_IFACE_DISPLAY, "") < 0) return 1;
+    if (vbus_subscribe(VBUS_IFACE_DISPLAY, "") < 0) {
+        printf("vbus_subscribe() failed\n");
+        return 1;
+    }
 
     g_comp.mx = g_comp.info.width / 2;
     g_comp.my = g_comp.info.height / 2;
 
     const char* desktop_argv[] = {g_comp.display_cfg.compositor_desktop_binary, NULL};
     const char* desktop_envp[] = {"PATH=/bin", "TERM=tty0", NULL};
-    const HANDLE app_log = open("/var/log/myapp.log", O_WRONLY | O_CREAT | O_TRUNC);
+    const HANDLE app_log = open("/var/log/desktop.log", O_WRONLY | O_CREAT | O_TRUNC);
 
     spawn_config_t cfg = {.stdin_handle = 0, .stdout_handle = app_log, .stderr_handle = app_log, .bg_realm = 1};
     const int64_t rid =
@@ -1448,8 +1499,13 @@ int main(int argc, char* argv[]) {
         g_comp.desktop_realm_id = (RealmID)rid;
         g_comp.desktop_spawned = true;
     } else {
-        printf("Spawning desktop failed");
+        printf("Spawning desktop failed\n");
     }
+
+    ves_mutex_init(&g_mouse_ring.mtx);
+    g_mouse_ring.head = 0;
+    g_mouse_ring.tail = 0;
+    spawn_unit(realm_id, (uint64_t)mouse_reader_unit, 0);
 
     composite_frame();
     const uint32_t frame_ns = (1000000000LL / g_comp.display_cfg.target_fps);
