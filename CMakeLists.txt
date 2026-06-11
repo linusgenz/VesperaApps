@@ -7,6 +7,8 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+set(CMAKE_BUILD_TYPE Debug)
+
 # ────────────────────────────────────────────────────────────────
 # Sysroot — same resolution order as VesperaOS:
 #   1. CMake cache variable (-DVESPERA_SYSROOT=…)
@@ -22,9 +24,6 @@ if (NOT DEFINED VESPERA_SYSROOT)
 endif ()
 get_filename_component(VESPERA_SYSROOT "${VESPERA_SYSROOT}" ABSOLUTE)
 message(STATUS "VesperaApps – sysroot: ${VESPERA_SYSROOT}")
-
-# NOTE: sysroot must already be populated by VesperaOS's sysroot_install
-# target before building apps (handled by VesperaWorkspace/Makefile).
 
 # ────────────────────────────────────────────────────────────────
 # Compiler / Linker flags
@@ -75,7 +74,6 @@ function(vespera_bin name)
     set(_crt0 ${VESPERA_SYSROOT}/usr/lib/crt0.o)
     add_executable(${name} ${_crt0} ${sources})
 
-    # Detect C++ sources so the right stdlib is linked automatically
     set(IS_CPP FALSE)
     foreach (src ${sources})
         if (src MATCHES "\\.(cpp|cc|cxx)$")
@@ -124,7 +122,6 @@ function(vespera_bin name)
     target_link_libraries(${name} PRIVATE ${_link_libs})
 
     set_target_properties(${name} PROPERTIES
-            RUNTIME_OUTPUT_DIRECTORY ${VESPERA_SYSROOT}/bin
             LINK_FLAGS "${USER_LD_FLAGS}"
     )
 
@@ -201,11 +198,21 @@ endforeach ()
 
 get_property(_all_bins GLOBAL PROPERTY VESPERA_BIN_TARGETS)
 
-# Primary target: build all apps + headers
-add_custom_target(apps
-        DEPENDS ${_all_bins}
-        COMMENT "Building all VesperaApps"
+install(
+        DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/assets/icons/
+        DESTINATION ${VESPERA_SYSROOT}/usr/share/icons
+        COMPONENT apps
 )
 
-# Backward-compat alias
-add_custom_target(elfs DEPENDS apps)
+install(
+        TARGETS ${_all_bins}
+        RUNTIME
+        DESTINATION ${VESPERA_SYSROOT}/bin
+        COMPONENT apps
+)
+
+add_custom_target(install_apps
+        DEPENDS ${_all_bins}
+        COMMAND ${CMAKE_COMMAND} --install ${CMAKE_BINARY_DIR} --component apps
+        COMMENT "Installing apps to sysroot"
+)
