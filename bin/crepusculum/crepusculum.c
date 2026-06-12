@@ -31,7 +31,6 @@
 
 /* --- Constants & Macros --------------------------------------------------- */
 #define MAX_WINDOWS 16
-#define MICE_BATCH 32
 #define MOUSE_BUF_SIZE 256  /* must be power of two */
 
 // Limits
@@ -162,8 +161,15 @@ typedef struct compositor_state {
     uint32_t next_window_id;
 
     int32_t mx, my;
+    int32_t prev_mx, prev_my;  /* cursor position from last composite, for dirty erase */
     uint8_t last_buttons;
     bool needs_present;
+
+    /* Accumulated dirty region; expanded by events, reset after each composite.
+     * x1 < x0 (INT32_MIN / INT32_MAX) indicates the region is empty. */
+    struct {
+        int32_t x0, y0, x1, y1;
+    } dirty_region;
 
     crep_window_t* drag_window;
     int32_t drag_grab_x, drag_grab_y;
@@ -192,6 +198,10 @@ typedef struct compositor_state {
     int z_order[MAX_WINDOWS];
     int z_count;
 } compositor_state_t;
+
+/* Forward declarations */
+static void dirty_expand(int32_t x0, int32_t y0, int32_t x1, int32_t y1);
+static void dirty_expand_window(const crep_window_t* w);
 
 static RealmID realm_id = 0;
 static compositor_state_t g_comp;
@@ -454,10 +464,13 @@ static void window_toggle_maximize(crep_window_t* w) {
         w->saved_h = w->h;
         w->saved_content_w = w->content_w;
         w->saved_content_h = w->content_h;
+        dirty_expand_window(w);  /* old bounds */
         w->maximized = true;
         window_apply_maximize(w);
+        dirty_expand_window(w);  /* new (maximized) bounds */
     }
     else {
+        dirty_expand_window(w);  /* old (maximized) bounds */
         w->maximized = false;
         w->x = w->saved_x;
         w->y = w->saved_y;
@@ -465,6 +478,7 @@ static void window_toggle_maximize(crep_window_t* w) {
         w->h = w->saved_h;
         w->content_w = w->saved_content_w;
         w->content_h = w->saved_content_h;
+        dirty_expand_window(w);  /* restored bounds */
 
         window_resize_shm(w);
         const vbus_display_configure_t conf = {.window_id = w->id, .width = w->content_w, .height = w->content_h};
@@ -490,6 +504,7 @@ static void window_minimize(crep_window_t* w) {
     }
 
     w->minimized = true;
+    dirty_expand_window(w);
     g_comp.needs_present = true;
 
     if (g_comp.focused_window == w) {
@@ -509,6 +524,7 @@ static void window_minimize(crep_window_t* w) {
 
 static void window_restore(crep_window_t* w) {
     w->minimized = false;
+    dirty_expand_window(w);
     g_comp.needs_present = true;
 
     if (g_comp.desktop_spawned && w->owner_realm_id != g_comp.desktop_realm_id) {
@@ -541,16 +557,19 @@ static void window_set_focus(crep_window_t* w) {
     z_raise(w_slot(w));
 
     if (w == prev) {
+        dirty_expand_window(w);
         g_comp.needs_present = true;
         return;
     }
 
     if (prev) {
+        dirty_expand_window(prev);
         const vbus_display_window_id_t notif = {.window_id = prev->id, ._pad = 0};
         vbus_signal_to(VBUS_IFACE_DISPLAY, VBUS_DISP_FOCUS_LOST, realm_id, prev->owner_realm_id, &notif, sizeof(notif));
     }
 
     g_comp.focused_window = w;
+    dirty_expand_window(w);
 
     const vbus_display_window_id_t gained = {.window_id = w->id, ._pad = 0};
     vbus_signal_to(VBUS_IFACE_DISPLAY, VBUS_DISP_FOCUS_GAINED, realm_id, w->owner_realm_id, &gained, sizeof(gained));
@@ -688,6 +707,7 @@ static void handle_destroy_window(const vbus_header_t* hdr, const vbus_display_w
     crep_window_t* w = find_window_by_id(req->window_id);
     if (!w) return;
 
+    dirty_expand_window(w);  /* capture the area the window occupied before removal */
     window_free_shm(w);
 
     if (g_comp.resize_window == w) g_comp.resize_window = NULL;
@@ -738,6 +758,7 @@ static int drain_vbus(void) {
             if (w) {
                 __atomic_store_n(&w->sync->dirty, 0u, __ATOMIC_RELAXED);
                 w->dirty = true;
+                dirty_expand_window(w);
                 g_comp.needs_present = true;
             }
         }
@@ -767,6 +788,7 @@ static int drain_vbus(void) {
             for (int i = 0; i < MAX_WINDOWS; i++) {
                 if (g_comp.windows[i].active && g_comp.windows[i].maximized) window_apply_maximize(&g_comp.windows[i]);
             }
+            dirty_expand(0, 0, (int32_t)g_comp.info.width, (int32_t)g_comp.info.height);
             g_comp.needs_present = true;
         }
         processed++;
@@ -774,10 +796,40 @@ static int drain_vbus(void) {
     return processed;
 }
 
-/* --- Graphics Primitives & Compositing ------------------------------------ */
-static void backbuf_clear(void) {
-    uint32_t total = g_comp.info.width * g_comp.info.height;
-    for (uint32_t i = 0; i < total; i++) g_comp.backbuf[i] = g_comp.display_cfg.bg_color;
+/* --- Dirty Region Helpers ------------------------------------------------- */
+static void dirty_reset(void) {
+    g_comp.dirty_region.x0 = INT32_MAX;
+    g_comp.dirty_region.y0 = INT32_MAX;
+    g_comp.dirty_region.x1 = INT32_MIN;
+    g_comp.dirty_region.y1 = INT32_MIN;
+}
+
+static bool dirty_is_empty(void) {
+    return g_comp.dirty_region.x1 <= g_comp.dirty_region.x0;
+}
+
+static void dirty_expand(int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
+    if (x0 < g_comp.dirty_region.x0) g_comp.dirty_region.x0 = x0;
+    if (y0 < g_comp.dirty_region.y0) g_comp.dirty_region.y0 = y0;
+    if (x1 > g_comp.dirty_region.x1) g_comp.dirty_region.x1 = x1;
+    if (y1 > g_comp.dirty_region.y1) g_comp.dirty_region.y1 = y1;
+}
+
+static void dirty_expand_window(const crep_window_t* w) {
+    if (!w || !w->active) return;
+    dirty_expand((int32_t)w->x, (int32_t)w->y,
+                 (int32_t)(w->x + w->w), (int32_t)(w->y + w->h));
+}
+
+static void dirty_expand_cursor(int32_t cx, int32_t cy) {
+    if (g_xcursor_ok) {
+        dirty_expand(cx - (int32_t)g_xcursor.xhot,
+                     cy - (int32_t)g_xcursor.yhot,
+                     cx - (int32_t)g_xcursor.xhot + (int32_t)g_xcursor.width,
+                     cy - (int32_t)g_xcursor.yhot + (int32_t)g_xcursor.height);
+    } else {
+        dirty_expand(cx, cy, cx + 16, cy + 16);
+    }
 }
 
 static void backbuf_blit_window(const crep_window_t* w) {
@@ -1007,27 +1059,64 @@ static void ssd_draw_decorations(crep_window_t* w) {
 }
 
 static void composite_frame(void) {
-    backbuf_clear();
+    const int32_t sw = (int32_t)g_comp.info.width;
+    const int32_t sh = (int32_t)g_comp.info.height;
 
+    /* Clamp dirty region to screen bounds */
+    if (g_comp.dirty_region.x0 < 0)  g_comp.dirty_region.x0 = 0;
+    if (g_comp.dirty_region.y0 < 0)  g_comp.dirty_region.y0 = 0;
+    if (g_comp.dirty_region.x1 > sw) g_comp.dirty_region.x1 = sw;
+    if (g_comp.dirty_region.y1 > sh) g_comp.dirty_region.y1 = sh;
+
+    if (dirty_is_empty()) {
+        g_comp.needs_present = false;
+        return;
+    }
+
+    const uint32_t dr_x = (uint32_t)g_comp.dirty_region.x0;
+    const uint32_t dr_y = (uint32_t)g_comp.dirty_region.y0;
+    const uint32_t dr_w = (uint32_t)(g_comp.dirty_region.x1 - g_comp.dirty_region.x0);
+    const uint32_t dr_h = (uint32_t)(g_comp.dirty_region.y1 - g_comp.dirty_region.y0);
+
+    /* Fill only the dirty rect with the background color */
+    for (uint32_t row = dr_y; row < dr_y + dr_h; row++) {
+        uint32_t* dst = &g_comp.backbuf[row * (uint32_t)sw + dr_x];
+        for (uint32_t col = 0; col < dr_w; col++) dst[col] = g_comp.display_cfg.bg_color;
+    }
+
+    /* Composite all windows whose bounding box intersects the dirty rect.
+     * Non-dirty windows must be repainted too because we cleared their pixels. */
     for (int zi = 0; zi < g_comp.z_count; zi++) {
         crep_window_t* w = &g_comp.windows[g_comp.z_order[zi]];
         if (!w->active || !w->pixels || w->minimized) continue;
+
+        if ((int32_t)(w->x + w->w) <= g_comp.dirty_region.x0 ||
+            (int32_t)w->x           >= g_comp.dirty_region.x1 ||
+            (int32_t)(w->y + w->h) <= g_comp.dirty_region.y0 ||
+            (int32_t)w->y           >= g_comp.dirty_region.y1) continue;
+
         backbuf_blit_window(w);
         if (!w->fullscreen) ssd_draw_decorations(w);
         w->dirty = false;
     }
 
     backbuf_draw_cursor();
+    g_comp.prev_mx = g_comp.mx;
+    g_comp.prev_my = g_comp.my;
 
-    fb_blit_t full_blit = {
-        .pixels = g_comp.backbuf,
-        .src_stride = g_comp.info.width,
-        .src_height = g_comp.info.height,
-        .width = g_comp.info.width,
-        .height = g_comp.info.height
+    fb_blit_t blit = {
+        .pixels     = &g_comp.backbuf[dr_y * (uint32_t)sw + dr_x],
+        .src_stride = (uint32_t)sw,
+        .src_height = dr_h,
+        .dst_x      = dr_x,
+        .dst_y      = dr_y,
+        .width      = dr_w,
+        .height     = dr_h,
     };
-    ioctl(g_comp.fb, FB_IOCTL_BLIT, &full_blit);
+    ioctl(g_comp.fb, FB_IOCTL_BLIT, &blit);
     ioctl(g_comp.fb, FB_IOCTL_PRESENT, NULL);
+
+    dirty_reset();
     g_comp.needs_present = false;
 }
 
@@ -1087,10 +1176,12 @@ static void window_apply_resize(crep_window_t* w,
 
     const bool size_changed = (new_cw != w->content_w || new_ch != w->content_h);
 
+    dirty_expand_window(w);  /* old bounds */
     w->x = (uint32_t)new_x;
     w->y = (uint32_t)new_y;
     w->w = (uint32_t)new_w;
     w->h = (uint32_t)new_h;
+    dirty_expand_window(w);  /* new bounds */
 
     if (size_changed) {
         w->content_w = new_cw;
@@ -1186,6 +1277,8 @@ static void handle_mouse_move(
     }
 
     if (g_comp.hover_btn_window != prev_hover_win || g_comp.hover_btn_idx != prev_hover_idx) {
+        if (prev_hover_win) dirty_expand_window(prev_hover_win);
+        if (g_comp.hover_btn_window) dirty_expand_window(g_comp.hover_btn_window);
         g_comp.needs_present = true;
     }
 
@@ -1194,8 +1287,10 @@ static void handle_mouse_move(
         const int32_t nx = g_comp.mx - g_comp.drag_grab_x;
         const int32_t ny = g_comp.my - g_comp.drag_grab_y;
 
+        dirty_expand_window(w);  /* old position */
         w->x = nx < 0 ? 0 : ((uint32_t)nx + w->w > g_comp.info.width ? g_comp.info.width - w->w : (uint32_t)nx);
         w->y = ny < 0 ? 0 : ((uint32_t)ny + w->h > g_comp.info.height ? g_comp.info.height - w->h : (uint32_t)ny);
+        dirty_expand_window(w);  /* new position */
         g_comp.needs_present = true;
         return;
     }
@@ -1298,6 +1393,7 @@ static bool process_mouse(void) {
                     if (btn >= 0) {
                         g_comp.pressed_btn_window = w;
                         g_comp.pressed_btn_idx = btn;
+                        dirty_expand_window(w);
                     }
                     else if (!w->maximized) {
                         g_comp.drag_window = w;
@@ -1315,6 +1411,7 @@ static bool process_mouse(void) {
             const int btn = g_comp.pressed_btn_idx;
             g_comp.pressed_btn_window = NULL;
             g_comp.pressed_btn_idx = BTN_NONE_IDX;
+            dirty_expand_window(w);
             g_comp.needs_present = true;
 
             const crep_window_t* w_under = find_window_at(g_comp.mx, g_comp.my);
@@ -1486,6 +1583,8 @@ int main(int argc, char* argv[]) {
 
     g_comp.mx = g_comp.info.width / 2;
     g_comp.my = g_comp.info.height / 2;
+    g_comp.prev_mx = g_comp.mx;
+    g_comp.prev_my = g_comp.my;
 
     const char* desktop_argv[] = {g_comp.display_cfg.compositor_desktop_binary, NULL};
     const char* desktop_envp[] = {"PATH=/bin", "TERM=tty0", NULL};
@@ -1507,17 +1606,30 @@ int main(int argc, char* argv[]) {
     g_mouse_ring.tail = 0;
     spawn_unit(realm_id, (uint64_t)mouse_reader_unit, 0);
 
+    dirty_reset();
+    dirty_expand(0, 0, (int32_t)g_comp.info.width, (int32_t)g_comp.info.height);
     composite_frame();
     const uint32_t frame_ns = (1000000000LL / g_comp.display_cfg.target_fps);
     int64_t next_frame = now_ns() + frame_ns;
 
     while (true) {
-        if (process_mouse()) g_comp.needs_present = true;
+        if (process_mouse()) {
+            /* Expand dirty for cursor erase (old pos) and redraw (new pos) */
+            dirty_expand_cursor(g_comp.prev_mx, g_comp.prev_my);
+            dirty_expand_cursor(g_comp.mx, g_comp.my);
+            g_comp.prev_mx = g_comp.mx;
+            g_comp.prev_my = g_comp.my;
+            g_comp.needs_present = true;
+        }
         drain_vbus();
         if (g_comp.needs_present) composite_frame();
 
         sleep_ns(next_frame - now_ns());
         next_frame += frame_ns;
+        {
+            const int64_t now = now_ns();
+            if (next_frame < now) next_frame = now + frame_ns;  /* drop missed frames */
+        }
     }
 
     return 0;
