@@ -13,8 +13,9 @@
 #include <vbus.h>
 #include <vespera/dev/ioctl_framebuffer.h>
 #include <vespera/dev/mice.h>
-#include <vespera/fflags.h>
+#include <vespera/fcntl.h>
 #include <vespera/handles.h>
+#include <chronos.h>
 
 #include <unit.h>
 
@@ -24,10 +25,12 @@
 #include "luautil.h"
 #include "monteserrat_12.c"
 #include "poll.h"
+#include "unistd.h"
 #include "window_close_symbolic_16px.h"
 #include "window_maximize_symbolic_16px.h"
 #include "window_minimize_symbolic_16px.h"
 #include "xcursor_loader.h"
+#include "../../../VesperaOS/userspace/lib/include/fcntl.h"
 
 /* --- Constants & Macros --------------------------------------------------- */
 #define MAX_WINDOWS 16
@@ -103,8 +106,8 @@ typedef struct crep_window {
     RealmID owner_realm_id;
     uint64_t create_serial;
 
-    HANDLE sync_shm;
-    HANDLE fb_shm;
+    int sync_shm;
+    int fb_shm;
     char sync_shm_name[STR_MAX_SHM];
     char fb_shm_name[STR_MAX_SHM];
 
@@ -151,8 +154,8 @@ typedef struct {
 } display_config_t;
 
 typedef struct compositor_state {
-    HANDLE fb;
-    HANDLE mouse;
+    int fb;
+    int mouse;
     fb_info_t info;
     display_config_t display_cfg;
 
@@ -161,7 +164,7 @@ typedef struct compositor_state {
     uint32_t next_window_id;
 
     int32_t mx, my;
-    int32_t prev_mx, prev_my;  /* cursor position from last composite, for dirty erase */
+    int32_t prev_mx, prev_my; /* cursor position from last composite, for dirty erase */
     uint8_t last_buttons;
     bool needs_present;
 
@@ -211,9 +214,9 @@ static bool g_xcursor_ok = false;
 /* --- Async Mouse Ring Buffer ---------------------------------------------- */
 typedef struct {
     mice_event events[MOUSE_BUF_SIZE];
-    uint32_t   head;   /* writer advances head */
-    uint32_t   tail;   /* reader advances tail */
-    ves_mutex_t mtx;
+    uint32_t head; /* writer advances head */
+    uint32_t tail; /* reader advances tail */
+    //ves_mutex_t mtx;
 } mouse_ring_t;
 
 static mouse_ring_t g_mouse_ring;
@@ -266,6 +269,10 @@ static uint32_t color_darken(uint32_t c, uint8_t amount) {
     return color_make(color_get_a(c), r, g, b);
 }
 
+static inline void fill_u32(uint32_t* restrict dst, uint32_t val, uint32_t count) {
+    for (uint32_t i = 0; i < count; i++) dst[i] = val;
+}
+
 /* --- Initialization & Basics ---------------------------------------------- */
 static void init_cursor_pixels(void) {
     for (int row = 0; row < 16; row++) {
@@ -292,8 +299,7 @@ static void init_cursor_pixels(void) {
         printf(
             "Crepusculum: cursor loaded from '%s' (%ux%u)\n", FALLBACK_XCURSOR_PATH, g_xcursor.width, g_xcursor.height
         );
-    }
-    else {
+    } else {
         printf("Crepusculum: xcursor load failed, using built-in fallback\n");
     }
 }
@@ -464,13 +470,12 @@ static void window_toggle_maximize(crep_window_t* w) {
         w->saved_h = w->h;
         w->saved_content_w = w->content_w;
         w->saved_content_h = w->content_h;
-        dirty_expand_window(w);  /* old bounds */
+        dirty_expand_window(w); /* old bounds */
         w->maximized = true;
         window_apply_maximize(w);
-        dirty_expand_window(w);  /* new (maximized) bounds */
-    }
-    else {
-        dirty_expand_window(w);  /* old (maximized) bounds */
+        dirty_expand_window(w); /* new (maximized) bounds */
+    } else {
+        dirty_expand_window(w); /* old (maximized) bounds */
         w->maximized = false;
         w->x = w->saved_x;
         w->y = w->saved_y;
@@ -478,7 +483,7 @@ static void window_toggle_maximize(crep_window_t* w) {
         w->h = w->saved_h;
         w->content_w = w->saved_content_w;
         w->content_h = w->saved_content_h;
-        dirty_expand_window(w);  /* restored bounds */
+        dirty_expand_window(w); /* restored bounds */
 
         window_resize_shm(w);
         const vbus_display_configure_t conf = {.window_id = w->id, .width = w->content_w, .height = w->content_h};
@@ -539,11 +544,9 @@ static void window_toggle_minimize(crep_window_t* w) {
     if (w->minimized) {
         window_restore(w);
         window_set_focus(w);
-    }
-    else if (w != g_comp.focused_window) {
+    } else if (w != g_comp.focused_window) {
         window_set_focus(w);
-    }
-    else {
+    } else {
         window_minimize(w);
     }
 }
@@ -640,8 +643,7 @@ static void handle_create_window(const vbus_header_t* hdr, const vbus_display_cr
         w->y = 0;
         w->content_x = 0;
         w->content_y = 0;
-    }
-    else {
+    } else {
         w->content_w = req->width;
         w->content_h = req->height;
         w->w = req->width + cfg->ssd_border_w * 2;
@@ -668,8 +670,7 @@ static void handle_create_window(const vbus_header_t* hdr, const vbus_display_cr
         memmove(&g_comp.z_order[1], &g_comp.z_order[0], (size_t)g_comp.z_count * sizeof(int));
         g_comp.z_order[0] = w_slot(w);
         g_comp.z_count++;
-    }
-    else {
+    } else {
         z_add(w_slot(w));
     }
 
@@ -707,7 +708,7 @@ static void handle_destroy_window(const vbus_header_t* hdr, const vbus_display_w
     crep_window_t* w = find_window_by_id(req->window_id);
     if (!w) return;
 
-    dirty_expand_window(w);  /* capture the area the window occupied before removal */
+    dirty_expand_window(w); /* capture the area the window occupied before removal */
     window_free_shm(w);
 
     if (g_comp.resize_window == w) g_comp.resize_window = NULL;
@@ -752,8 +753,7 @@ static int drain_vbus(void) {
 
         if (hdr.type == VBUS_MSG_CALL && strcmp(hdr.member, VBUS_DISP_CREATE_WINDOW) == 0) {
             handle_create_window(&hdr, &payload.create_window);
-        }
-        else if (hdr.type == VBUS_MSG_SIGNAL && strcmp(hdr.member, VBUS_DISP_WINDOW_COMMIT) == 0) {
+        } else if (hdr.type == VBUS_MSG_SIGNAL && strcmp(hdr.member, VBUS_DISP_WINDOW_COMMIT) == 0) {
             crep_window_t* w = find_window_by_id(payload.commit.window_id);
             if (w) {
                 __atomic_store_n(&w->sync->dirty, 0u, __ATOMIC_RELAXED);
@@ -761,15 +761,12 @@ static int drain_vbus(void) {
                 dirty_expand_window(w);
                 g_comp.needs_present = true;
             }
-        }
-        else if (hdr.type == VBUS_MSG_CALL && strcmp(hdr.member, VBUS_DISP_DESTROY_WINDOW) == 0) {
+        } else if (hdr.type == VBUS_MSG_CALL && strcmp(hdr.member, VBUS_DISP_DESTROY_WINDOW) == 0) {
             handle_destroy_window(&hdr, &payload.destroy_window);
-        }
-        else if (hdr.type == VBUS_MSG_SIGNAL && strcmp(hdr.member, VBUS_DISP_WINDOW_ACTIVATE) == 0) {
+        } else if (hdr.type == VBUS_MSG_SIGNAL && strcmp(hdr.member, VBUS_DISP_WINDOW_ACTIVATE) == 0) {
             crep_window_t* w = find_window_by_id(payload.activate.window_id);
             if (w) window_toggle_minimize(w);
-        }
-        else if (hdr.type == VBUS_MSG_SIGNAL && strcmp(hdr.member, VBUS_DISP_SET_STRUT) == 0) {
+        } else if (hdr.type == VBUS_MSG_SIGNAL && strcmp(hdr.member, VBUS_DISP_SET_STRUT) == 0) {
             const vbus_display_set_strut_t* s = &payload.set_strut;
             switch (s->edge) {
             case CREP_STRUT_TOP:
@@ -857,22 +854,30 @@ static void backbuf_blit_window(const crep_window_t* w) {
 static void backbuf_blit_cursor_pixels(
     const uint32_t* src_pixels, uint32_t w, uint32_t h, int32_t origin_x, int32_t origin_y
 ) {
-    const uint32_t sw = g_comp.info.width;
-    const uint32_t sh = g_comp.info.height;
+    const int32_t sw = (int32_t)g_comp.info.width;
+    const int32_t sh = (int32_t)g_comp.info.height;
 
-    for (uint32_t row = 0; row < h; row++) {
-        const int32_t py = origin_y + (int32_t)row;
-        if (py < 0 || (uint32_t)py >= sh) continue;
+    /* Clip the source rect to the screen once, outside any loop.
+     * For a fully on-screen cursor (the common case) this eliminates all
+     * per-pixel conditional branches in the inner loop. */
+    int32_t col_start = 0, col_end = (int32_t)w;
+    int32_t row_start = 0, row_end = (int32_t)h;
 
-        for (uint32_t col = 0; col < w; col++) {
-            const int32_t px = origin_x + (int32_t)col;
-            if (px < 0 || (uint32_t)px >= sw) continue;
+    if (origin_x < 0) col_start = -origin_x;
+    if (origin_x + col_end > sw) col_end = sw - origin_x;
+    if (origin_y < 0) row_start = -origin_y;
+    if (origin_y + row_end > sh) row_end = sh - origin_y;
 
-            const uint32_t fg = src_pixels[row * w + col];
+    if (col_start >= col_end || row_start >= row_end) return;
+
+    for (int32_t row = row_start; row < row_end; row++) {
+        const int32_t py = origin_y + row;
+        for (int32_t col = col_start; col < col_end; col++) {
+            const uint32_t fg = src_pixels[(uint32_t)row * w + (uint32_t)col];
             const uint8_t a = color_get_a(fg);
             if (a == 0) continue;
 
-            const uint32_t idx = (uint32_t)py * sw + (uint32_t)px;
+            const uint32_t idx = (uint32_t)py * (uint32_t)sw + (uint32_t)(origin_x + col);
             g_comp.backbuf[idx] = color_blend(fg, g_comp.backbuf[idx], a);
         }
     }
@@ -883,8 +888,7 @@ static void backbuf_draw_cursor(void) {
         backbuf_blit_cursor_pixels(
             g_xcursor.pixels, g_xcursor.width, g_xcursor.height, g_comp.mx - g_xcursor.xhot, g_comp.my - g_xcursor.yhot
         );
-    }
-    else {
+    } else {
         backbuf_blit_cursor_pixels(g_cursor_pixels, 16, 16, g_comp.mx, g_comp.my);
     }
 }
@@ -969,9 +973,12 @@ static void ssd_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32
     const uint32_t y1 = y + h > sh ? sh : y + h;
 
     if (x >= x1 || y >= y1) return;
-    for (uint32_t row = y; row < y1; row++) {
-        uint32_t* dst = &g_comp.backbuf[row * sw + x];
-        for (uint32_t col = 0; col < x1 - x; col++) dst[col] = color;
+    const uint32_t run = x1 - x;
+
+    uint32_t* first = &g_comp.backbuf[y * sw + x];
+    fill_u32(first, color, run);
+    for (uint32_t row = y + 1; row < y1; row++) {
+        memcpy(&g_comp.backbuf[row * sw + x], first, run * sizeof(uint32_t));
     }
 }
 
@@ -1063,8 +1070,8 @@ static void composite_frame(void) {
     const int32_t sh = (int32_t)g_comp.info.height;
 
     /* Clamp dirty region to screen bounds */
-    if (g_comp.dirty_region.x0 < 0)  g_comp.dirty_region.x0 = 0;
-    if (g_comp.dirty_region.y0 < 0)  g_comp.dirty_region.y0 = 0;
+    if (g_comp.dirty_region.x0 < 0) g_comp.dirty_region.x0 = 0;
+    if (g_comp.dirty_region.y0 < 0) g_comp.dirty_region.y0 = 0;
     if (g_comp.dirty_region.x1 > sw) g_comp.dirty_region.x1 = sw;
     if (g_comp.dirty_region.y1 > sh) g_comp.dirty_region.y1 = sh;
 
@@ -1078,10 +1085,11 @@ static void composite_frame(void) {
     const uint32_t dr_w = (uint32_t)(g_comp.dirty_region.x1 - g_comp.dirty_region.x0);
     const uint32_t dr_h = (uint32_t)(g_comp.dirty_region.y1 - g_comp.dirty_region.y0);
 
-    /* Fill only the dirty rect with the background color */
-    for (uint32_t row = dr_y; row < dr_y + dr_h; row++) {
-        uint32_t* dst = &g_comp.backbuf[row * (uint32_t)sw + dr_x];
-        for (uint32_t col = 0; col < dr_w; col++) dst[col] = g_comp.display_cfg.bg_color;
+    const uint32_t bg = g_comp.display_cfg.bg_color;
+    uint32_t* const first_row = &g_comp.backbuf[dr_y * (uint32_t)sw + dr_x];
+    fill_u32(first_row, bg, dr_w);
+    for (uint32_t row = dr_y + 1; row < dr_y + dr_h; row++) {
+        memcpy(&g_comp.backbuf[row * (uint32_t)sw + dr_x], first_row, dr_w * sizeof(uint32_t));
     }
 
     /* Composite all windows whose bounding box intersects the dirty rect.
@@ -1091,9 +1099,10 @@ static void composite_frame(void) {
         if (!w->active || !w->pixels || w->minimized) continue;
 
         if ((int32_t)(w->x + w->w) <= g_comp.dirty_region.x0 ||
-            (int32_t)w->x           >= g_comp.dirty_region.x1 ||
+            (int32_t)w->x >= g_comp.dirty_region.x1 ||
             (int32_t)(w->y + w->h) <= g_comp.dirty_region.y0 ||
-            (int32_t)w->y           >= g_comp.dirty_region.y1) continue;
+            (int32_t)w->y >= g_comp.dirty_region.y1)
+            continue;
 
         backbuf_blit_window(w);
         if (!w->fullscreen) ssd_draw_decorations(w);
@@ -1105,13 +1114,13 @@ static void composite_frame(void) {
     g_comp.prev_my = g_comp.my;
 
     fb_blit_t blit = {
-        .pixels     = &g_comp.backbuf[dr_y * (uint32_t)sw + dr_x],
+        .pixels = &g_comp.backbuf[dr_y * (uint32_t)sw + dr_x],
         .src_stride = (uint32_t)sw,
         .src_height = dr_h,
-        .dst_x      = dr_x,
-        .dst_y      = dr_y,
-        .width      = dr_w,
-        .height     = dr_h,
+        .dst_x = dr_x,
+        .dst_y = dr_y,
+        .width = dr_w,
+        .height = dr_h,
     };
     ioctl(g_comp.fb, FB_IOCTL_BLIT, &blit);
     ioctl(g_comp.fb, FB_IOCTL_PRESENT, NULL);
@@ -1164,9 +1173,11 @@ static resize_edge_t hit_test_resize_edge(const crep_window_t* w, int32_t mx, in
     return RESIZE_NONE;
 }
 
-static void window_apply_resize(crep_window_t* w,
-                                int32_t new_x, int32_t new_y,
-                                int32_t new_w, int32_t new_h) {
+static void window_apply_resize(
+    crep_window_t* w,
+    int32_t new_x, int32_t new_y,
+    int32_t new_w, int32_t new_h
+) {
     const display_config_t* cfg = &g_comp.display_cfg;
     const int32_t frame_h = cfg->ssd_titlebar_h + cfg->ssd_border_w;
     const int32_t frame_lr = cfg->ssd_border_w * 2;
@@ -1176,12 +1187,12 @@ static void window_apply_resize(crep_window_t* w,
 
     const bool size_changed = (new_cw != w->content_w || new_ch != w->content_h);
 
-    dirty_expand_window(w);  /* old bounds */
+    dirty_expand_window(w); /* old bounds */
     w->x = (uint32_t)new_x;
     w->y = (uint32_t)new_y;
     w->w = (uint32_t)new_w;
     w->h = (uint32_t)new_h;
-    dirty_expand_window(w);  /* new bounds */
+    dirty_expand_window(w); /* new bounds */
 
     if (size_changed) {
         w->content_w = new_cw;
@@ -1226,8 +1237,7 @@ static void handle_resize_move(int32_t mx, int32_t my) {
         if (new_w < min_w) new_w = min_w;
         if (new_x + new_w > (int32_t)g_comp.info.width)
             new_w = (int32_t)g_comp.info.width - new_x;
-    }
-    else if (e == RESIZE_W || e == RESIZE_SW) {
+    } else if (e == RESIZE_W || e == RESIZE_SW) {
         const int32_t fixed_right = (int32_t)g_comp.resize_orig_x + (int32_t)g_comp.resize_orig_w;
         new_x += dx;
         if (new_x < 0) new_x = 0;
@@ -1287,10 +1297,10 @@ static void handle_mouse_move(
         const int32_t nx = g_comp.mx - g_comp.drag_grab_x;
         const int32_t ny = g_comp.my - g_comp.drag_grab_y;
 
-        dirty_expand_window(w);  /* old position */
+        dirty_expand_window(w); /* old position */
         w->x = nx < 0 ? 0 : ((uint32_t)nx + w->w > g_comp.info.width ? g_comp.info.width - w->w : (uint32_t)nx);
         w->y = ny < 0 ? 0 : ((uint32_t)ny + w->h > g_comp.info.height ? g_comp.info.height - w->h : (uint32_t)ny);
-        dirty_expand_window(w);  /* new position */
+        dirty_expand_window(w); /* new position */
         g_comp.needs_present = true;
         return;
     }
@@ -1322,19 +1332,20 @@ static void mouse_reader_unit(uint64_t arg) {
     mice_event ev;
 
     while (true) {
-        pollhdl_t pfd = { .hdl = g_comp.mouse, .events = POLLIN };
+        struct pollfd pfd = {.fd = g_comp.mouse, .events = POLLIN};
         if (poll(&pfd, 1, -1) <= 0) continue;
 
         const ssize_t n = read(g_comp.mouse, &ev, sizeof(ev));
         if (n != (ssize_t)sizeof(ev)) continue;
 
-        ves_mutex_lock(&g_mouse_ring.mtx);
+       // ves_mutex_lock(&g_mouse_ring.mtx);
         const uint32_t next = (g_mouse_ring.head + 1u) & (MOUSE_BUF_SIZE - 1u);
-        if (next != g_mouse_ring.tail) {           /* drop on full */
+        if (next != g_mouse_ring.tail) {
+            /* drop on full */
             g_mouse_ring.events[g_mouse_ring.head] = ev;
             g_mouse_ring.head = next;
         }
-        ves_mutex_unlock(&g_mouse_ring.mtx);
+        //ves_mutex_unlock(&g_mouse_ring.mtx);
     }
 }
 
@@ -1343,12 +1354,12 @@ static bool process_mouse(void) {
     mice_event events[MOUSE_BUF_SIZE];
     size_t count = 0;
 
-    ves_mutex_lock(&g_mouse_ring.mtx);
+   // ves_mutex_lock(&g_mouse_ring.mtx);
     while (g_mouse_ring.tail != g_mouse_ring.head) {
         events[count++] = g_mouse_ring.events[g_mouse_ring.tail];
         g_mouse_ring.tail = (g_mouse_ring.tail + 1u) & (MOUSE_BUF_SIZE - 1u);
     }
-    ves_mutex_unlock(&g_mouse_ring.mtx);
+  // ves_mutex_unlock(&g_mouse_ring.mtx);
 
     if (count == 0) return false;
     bool moved = false;
@@ -1394,8 +1405,7 @@ static bool process_mouse(void) {
                         g_comp.pressed_btn_window = w;
                         g_comp.pressed_btn_idx = btn;
                         dirty_expand_window(w);
-                    }
-                    else if (!w->maximized) {
+                    } else if (!w->maximized) {
                         g_comp.drag_window = w;
                         g_comp.drag_grab_x = g_comp.mx - (int32_t)w->x;
                         g_comp.drag_grab_y = g_comp.my - (int32_t)w->y;
@@ -1420,8 +1430,7 @@ static bool process_mouse(void) {
                 if (btn == BTN_CLOSE_IDX) {
                     vbus_display_window_id_t req = {w->id, 0};
                     handle_destroy_window(NULL, &req);
-                }
-                else if (btn == BTN_MAXIMIZE_IDX)
+                } else if (btn == BTN_MAXIMIZE_IDX)
                     window_toggle_maximize(w);
                 else if (btn == BTN_MINIMIZE_IDX)
                     window_minimize(w);
@@ -1548,70 +1557,149 @@ int main(int argc, char* argv[]) {
     (void)argc;
     (void)argv;
 
+    CHRONOS_CP_PHASE("display", "start");
+
     memset(&g_comp, 0, sizeof(g_comp));
     g_comp.next_window_id = 1;
     g_comp.hover_btn_idx = BTN_NONE_IDX;
     g_comp.pressed_btn_idx = BTN_NONE_IDX;
 
     realm_id = get_realm_id();
+    CHRONOS_CP_PHASE("display", "realm_ready");
 
     lua_State* L = luaL_newstate();
     luaL_openlibs(L);
     load_display_config(L, "/etc/crepusculum.lua", &g_comp.display_cfg);
     lua_close(L);
 
+    CHRONOS_CP_PHASE("display", "config_loaded");
+
     g_comp.fb = open("/dev/fb0", O_RDONLY);
     g_comp.mouse = open("/dev/mice", O_RDONLY);
-    if ((int64_t)g_comp.fb <= 0 || (int64_t)g_comp.mouse < 0) return 1;
 
-    if (ioctl(g_comp.fb, FB_IOCTL_GET_INFO, &g_comp.info) < 0) return 1;
+    if ((int64_t)g_comp.fb == -1 || (int64_t)g_comp.mouse == -1)
+        return 1;
 
-    const uint32_t backbuf_size = g_comp.info.width * g_comp.info.height * (uint32_t)sizeof(uint32_t);
-    g_comp.backbuf = (uint32_t*)mmap(NULL, backbuf_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (g_comp.backbuf == MAP_FAILED) return 1;
+    CHRONOS_CP_PHASE("display", "devices_opened");
+
+    if (ioctl(g_comp.fb, FB_IOCTL_GET_INFO, &g_comp.info) < 0)
+        return 1;
+
+    CHRONOS_CP_PHASE("display", "fb_info_loaded");
+
+    const uint32_t backbuf_size =
+        g_comp.info.width *
+        g_comp.info.height *
+        (uint32_t)sizeof(uint32_t);
+
+    g_comp.backbuf =
+        (uint32_t*)mmap(NULL,
+                        backbuf_size,
+                        PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS,
+                        -1,
+                        0);
+
+    if (g_comp.backbuf == MAP_FAILED)
+        return 1;
+
+    CHRONOS_CP_PHASE("display", "backbuffer_ready");
 
     init_cursor_pixels();
 
-    fb_clear_t clr = {.color = g_comp.display_cfg.bg_color};
+    CHRONOS_CP_PHASE("display", "cursor_initialized");
+
+    fb_clear_t clr = {
+        .color = g_comp.display_cfg.bg_color
+    };
+
     ioctl(g_comp.fb, FB_IOCTL_CLEAR, &clr);
     ioctl(g_comp.fb, FB_IOCTL_PRESENT, NULL);
+
+    CHRONOS_CP_PHASE("display", "display_cleared");
 
     if (vbus_subscribe(VBUS_IFACE_DISPLAY, "") < 0) {
         printf("vbus_subscribe() failed\n");
         return 1;
     }
 
+    CHRONOS_CP_PHASE("display", "vbus_subscribed");
+
     g_comp.mx = g_comp.info.width / 2;
     g_comp.my = g_comp.info.height / 2;
     g_comp.prev_mx = g_comp.mx;
     g_comp.prev_my = g_comp.my;
 
-    const char* desktop_argv[] = {g_comp.display_cfg.compositor_desktop_binary, NULL};
-    const char* desktop_envp[] = {"PATH=/bin", "TERM=tty0", NULL};
-    const HANDLE app_log = open("/var/log/desktop.log", O_WRONLY | O_CREAT | O_TRUNC);
+    const char* desktop_argv[] = {
+        g_comp.display_cfg.compositor_desktop_binary,
+        NULL
+    };
 
-    spawn_config_t cfg = {.stdin_handle = 0, .stdout_handle = app_log, .stderr_handle = app_log, .bg_realm = 1};
+    const char* desktop_envp[] = {
+        "PATH=/bin",
+        "TERM=tty0",
+        NULL
+    };
+
+    const int app_log =
+        open("/var/log/desktop.log",
+             O_WRONLY | O_CREAT | O_TRUNC);
+
+    CHRONOS_CP_PHASE("display", "desktop_log_ready");
+
+    spawn_config_t cfg = {
+        .stdin_handle = 0,
+        .stdout_handle = app_log,
+        .stderr_handle = app_log,
+        .bg_realm = 1
+    };
+
     const int64_t rid =
-        spawn_realm(g_comp.display_cfg.compositor_desktop_binary, (char**)desktop_argv, (char**)desktop_envp, &cfg);
+        spawn_realm(
+            g_comp.display_cfg.compositor_desktop_binary,
+            (char**)desktop_argv,
+            (char**)desktop_envp,
+            &cfg);
 
     if (rid > 0) {
         g_comp.desktop_realm_id = (RealmID)rid;
         g_comp.desktop_spawned = true;
+
+        CHRONOS_CP_PHASE("display", "desktop_spawned");
     } else {
         printf("Spawning desktop failed\n");
+
+        CHRONOS_CP_PHASE("display", "desktop_spawn_failed");
     }
 
-    ves_mutex_init(&g_mouse_ring.mtx);
+    //ves_mutex_init(&g_mouse_ring.mtx);
+
+    CHRONOS_CP_PHASE("display", "mouse_ring_ready");
+
     g_mouse_ring.head = 0;
     g_mouse_ring.tail = 0;
-    spawn_unit(realm_id, (uint64_t)mouse_reader_unit, 0);
+
+    spawn_unit(realm_id, (uint64_t)mouse_reader_unit, 0, 0);
+
+    CHRONOS_CP_PHASE("display", "mouse_thread_started");
 
     dirty_reset();
-    dirty_expand(0, 0, (int32_t)g_comp.info.width, (int32_t)g_comp.info.height);
+    dirty_expand(
+        0,
+        0,
+        (int32_t)g_comp.info.width,
+        (int32_t)g_comp.info.height);
+
     composite_frame();
+
+    CHRONOS_CP_PHASE("display", "first_composite_done");
+
     const uint32_t frame_ns = (1000000000LL / g_comp.display_cfg.target_fps);
     int64_t next_frame = now_ns() + frame_ns;
 
+    CHRONOS_CP_PHASE("display", "enter_main_loop");
+
+    CHRONOS_SUMMARY();
     while (true) {
         if (process_mouse()) {
             /* Expand dirty for cursor erase (old pos) and redraw (new pos) */
@@ -1628,7 +1716,7 @@ int main(int argc, char* argv[]) {
         next_frame += frame_ns;
         {
             const int64_t now = now_ns();
-            if (next_frame < now) next_frame = now + frame_ns;  /* drop missed frames */
+            if (next_frame < now) next_frame = now + frame_ns; /* drop missed frames */
         }
     }
 

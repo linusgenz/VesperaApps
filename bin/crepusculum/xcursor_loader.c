@@ -40,7 +40,7 @@
 #define XCURSOR_IMAGE_HEADER_LEN (9 * 4) /* chunk-header(4×4) + w+h+xhot+yhot+delay */
 
 #define XCURSOR_MAX_DIM UINT32_C(0x7fff)
-#define XCURSOR_MAX_NTOC UINT32_C(0x4000) /* Sanity-Limit: 16 384 TOC-Einträge */
+#define XCURSOR_MAX_NTOC UINT32_C(0x4000) /* sanity limit: 16 384 TOC entries */
 
 #ifndef XCURSOR_DEBUG
 #define XCURSOR_DEBUG 1
