@@ -17,7 +17,15 @@
 #include <vespera/handles.h>
 #include <chronos.h>
 
+#include <wayland-server.h>
+#include <wayland-server-protocol.h>
+#include <wayland-protocols/xdg-shell-server-protocol.h>
+
 #include <unit.h>
+
+#include "crepusculum.h"
+#include "crepusculum_xdg_shell.h"
+#include "crepusculum_wayland.h"
 
 #include "lauxlib.h"
 #include "lua.h"
@@ -30,17 +38,17 @@
 #include "window_maximize_symbolic_16px.h"
 #include "window_minimize_symbolic_16px.h"
 #include "xcursor_loader.h"
-#include "../../../VesperaOS/userspace/lib/include/fcntl.h"
+#include "fcntl.h"
+
+#define WAYLAND_SOCKET_PATH "/tmp/wayland-0"
+
+#define MICE_BTN_LEFT   (1u << 0)
+#define MICE_BTN_RIGHT  (1u << 1)
+#define MICE_BTN_MIDDLE (1u << 2)
 
 /* --- Constants & Macros --------------------------------------------------- */
-#define MAX_WINDOWS 16
-#define MOUSE_BUF_SIZE 256  /* must be power of two */
 
-// Limits
-#define STR_MAX_PATH 256
-#define STR_MAX_SHM 64
-#define STR_MAX_TITLE 64
-#define STR_MAX_OWNER 32
+#define MOUSE_BUF_SIZE 256  /* must be power of two */
 
 // Typography
 #define FONT_LINE_HEIGHT 15
@@ -61,12 +69,6 @@
 #define RESIZE_CORNER  20  /* px von der Ecke für diagonalen Handle  */
 #define MIN_CONTENT_W  160 /* minimale Content-Breite beim Resize     */
 #define MIN_CONTENT_H  80  /* minimale Content-Höhe beim Resize       */
-
-typedef enum {
-    RESIZE_NONE = 0,
-    RESIZE_S, RESIZE_E, RESIZE_W,
-    RESIZE_SE, RESIZE_SW,
-} resize_edge_t;
 
 static const uint8_t G_CURSOR_MAP[16][16] = {
     {2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
@@ -89,125 +91,13 @@ static const uint8_t G_CURSOR_MAP[16][16] = {
 
 static uint32_t g_cursor_pixels[16 * 16];
 
-typedef struct rect {
-    uint32_t x, y, w, h;
-} rect_t;
-
-typedef struct crep_window {
-    uint32_t id;
-    bool active;
-    bool dirty;
-    bool fullscreen;
-    bool maximized;
-    bool minimized;
-
-    char owner[STR_MAX_OWNER];
-    char title[STR_MAX_TITLE];
-    RealmID owner_realm_id;
-    uint64_t create_serial;
-
-    int sync_shm;
-    int fb_shm;
-    char sync_shm_name[STR_MAX_SHM];
-    char fb_shm_name[STR_MAX_SHM];
-
-    crep_sync_t* sync;
-    uint32_t* pixels;
-
-    uint32_t x, y, w, h;
-    uint32_t content_x, content_y;
-    uint32_t content_w, content_h;
-    uint32_t flags;
-
-    // Decoration bounding boxes
-    rect_t btn_close;
-    rect_t btn_maximize;
-    rect_t btn_minimize;
-
-    // Saved geometry for un-maximizing
-    uint32_t saved_x, saved_y, saved_w, saved_h;
-    uint32_t saved_content_w, saved_content_h;
-} crep_window_t;
-
-typedef struct {
-    int target_fps;
-    uint32_t bg_color;
-
-    int ssd_titlebar_h;
-    int ssd_border_w;
-    uint32_t ssd_color_titlebar;
-    uint32_t ssd_color_titlebar_inactive;
-    uint32_t ssd_color_border;
-    uint32_t ssd_color_title_fg;
-
-    char cursor_xcursor_path[STR_MAX_PATH];
-    uint32_t cursor_xcursor_target_size;
-
-    uint32_t ssd_color_btn_close;
-    uint32_t ssd_color_btn_maximize;
-    uint32_t ssd_color_btn_minimize;
-    int ssd_btn_size;
-    int ssd_btn_margin;
-    int ssd_btn_right_pad;
-
-    char compositor_desktop_binary[STR_MAX_PATH];
-} display_config_t;
-
-typedef struct compositor_state {
-    int fb;
-    int mouse;
-    fb_info_t info;
-    display_config_t display_cfg;
-
-    crep_window_t windows[MAX_WINDOWS];
-    uint32_t window_count;
-    uint32_t next_window_id;
-
-    int32_t mx, my;
-    int32_t prev_mx, prev_my; /* cursor position from last composite, for dirty erase */
-    uint8_t last_buttons;
-    bool needs_present;
-
-    /* Accumulated dirty region; expanded by events, reset after each composite.
-     * x1 < x0 (INT32_MIN / INT32_MAX) indicates the region is empty. */
-    struct {
-        int32_t x0, y0, x1, y1;
-    } dirty_region;
-
-    crep_window_t* drag_window;
-    int32_t drag_grab_x, drag_grab_y;
-
-    crep_window_t* resize_window;
-    resize_edge_t resize_edge;
-    int32_t resize_grab_x, resize_grab_y;
-    uint32_t resize_orig_x, resize_orig_y;
-    uint32_t resize_orig_w, resize_orig_h;
-
-    crep_window_t* hover_btn_window;
-    int hover_btn_idx;
-    crep_window_t* pressed_btn_window;
-    int pressed_btn_idx;
-
-    struct {
-        uint32_t top, bottom, left, right;
-    } struts;
-
-    RealmID desktop_realm_id;
-    bool desktop_spawned;
-
-    uint32_t* backbuf;
-
-    crep_window_t* focused_window;
-    int z_order[MAX_WINDOWS];
-    int z_count;
-} compositor_state_t;
 
 /* Forward declarations */
 static void dirty_expand(int32_t x0, int32_t y0, int32_t x1, int32_t y1);
-static void dirty_expand_window(const crep_window_t* w);
+static void window_focus_next(void);
 
 static RealmID realm_id = 0;
-static compositor_state_t g_comp;
+compositor_state_t g_comp;
 static loaded_cursor_t g_xcursor;
 static bool g_xcursor_ok = false;
 
@@ -325,7 +215,7 @@ static crep_window_t* find_window_by_owner(uint32_t owner) {
     return NULL;
 }
 
-static crep_window_t* alloc_window_slot(void) {
+crep_window_t* alloc_window_slot(void) {
     for (int i = 0; i < MAX_WINDOWS; i++) {
         if (!g_comp.windows[i].active) return &g_comp.windows[i];
     }
@@ -333,11 +223,11 @@ static crep_window_t* alloc_window_slot(void) {
 }
 
 /* --- Z-Order Management --------------------------------------------------- */
-static inline int w_slot(const crep_window_t* w) {
+inline int w_slot(const crep_window_t* w) {
     return (int)(w - g_comp.windows);
 }
 
-static void z_add(int slot) {
+void z_add(int slot) {
     if (g_comp.z_count < MAX_WINDOWS) g_comp.z_order[g_comp.z_count++] = slot;
 }
 
@@ -379,7 +269,7 @@ static void z_raise(int slot) {
 }
 
 /* --- SHM Buffers ---------------------------------------------------------- */
-static int window_alloc_shm(crep_window_t* w) {
+int window_alloc_shm(crep_window_t* w) {
     const uint32_t sync_size = sizeof(crep_sync_t);
     const uint32_t fb_size = w->content_w * w->content_h * CREP_BPP;
 
@@ -396,6 +286,8 @@ static int window_alloc_shm(crep_window_t* w) {
     w->pixels = (uint32_t*)mmap(NULL, fb_size, PROT_READ | PROT_WRITE, MAP_SHARED, w->fb_shm, 0);
     if (w->pixels == MAP_FAILED) return -1;
 
+    w->mapped_fb_size = fb_size;
+
     for (uint32_t i = 0; i < w->content_w * w->content_h; i++) w->pixels[i] = g_comp.display_cfg.bg_color;
 
     w->sync->width = w->content_w;
@@ -410,7 +302,7 @@ static int window_alloc_shm(crep_window_t* w) {
     return 0;
 }
 
-static void window_free_shm(crep_window_t* w) {
+void window_free_shm(crep_window_t* w) {
     if (w->sync && w->sync != MAP_FAILED) munmap(w->sync, sizeof(crep_sync_t));
     if (w->pixels && w->pixels != (void*)MAP_FAILED) munmap(w->pixels, (size_t)w->content_w * w->content_h * CREP_BPP);
     shm_unlink(w->sync_shm_name);
@@ -419,10 +311,11 @@ static void window_free_shm(crep_window_t* w) {
     w->pixels = NULL;
 }
 
-static int window_resize_shm(crep_window_t* w) {
+int window_resize_shm(crep_window_t* w) {
     if (w->pixels && w->pixels != MAP_FAILED) {
-        munmap(w->pixels, (size_t)w->content_w * w->content_h * CREP_BPP);
+        munmap(w->pixels, w->mapped_fb_size);   /* alte, tatsächlich gemappte Größe */
         w->pixels = NULL;
+        w->mapped_fb_size = 0;
     }
 
     const uint32_t new_fb_size = w->content_w * w->content_h * CREP_BPP;
@@ -431,6 +324,8 @@ static int window_resize_shm(crep_window_t* w) {
     w->pixels = (uint32_t*)mmap(NULL, new_fb_size, PROT_READ | PROT_WRITE, MAP_SHARED, w->fb_shm, 0);
     if (w->pixels == MAP_FAILED) return -1;
 
+    w->mapped_fb_size = new_fb_size;   /* NEU: nach erfolgreichem mmap aktualisieren */
+
     w->sync->width = w->content_w;
     w->sync->height = w->content_h;
     w->sync->pitch = w->content_w * CREP_BPP;
@@ -438,8 +333,65 @@ static int window_resize_shm(crep_window_t* w) {
 }
 
 /* --- Window Actions ------------------------------------------------------- */
-static void window_set_focus(crep_window_t* w);
 static void window_focus_next(void);
+
+/* Schickt xdg_toplevel.configure + xdg_surface.configure an einen Wayland-
+ * Client, mit den aktuellen Content-Massen und dem aktuellen State-Set
+ * (maximized/activated). Ein Configure ist nur ein VORSCHLAG -- der Client
+ * antwortet mit ack_configure und committed danach einen Buffer in dieser
+ * (oder einer eigenen) Groesse; wl_surface_iface_commit() passt das SHM-
+ * Backing dann an, falls sie abweicht.
+ *
+ * content_w/content_h = 0 bedeutet "Client waehlt selbst". */
+static void wayland_send_configure(crep_window_t* w, uint32_t content_w, uint32_t content_h) {
+    if (!w || !w->is_wayland || !w->xdg_toplevel_res || !w->xdg_surface_res) return;
+
+    /* Solange der Client noch keinen echten Buffer geliefert hat, sind
+     * content_w/content_h nur Platzhalter (1x1) -- die duerfen NIE als
+     * Groessenvorschlag rausgehen, sonst schrumpft das Fenster auf 1x1. */
+    if (!w->has_buffer) {
+        content_w = 0;
+        content_h = 0;
+    }
+    w->last_cfg_w = content_w;
+    w->last_cfg_h = content_h;
+
+    struct wl_array states;
+    wl_array_init(&states);
+
+    if (w->maximized) {
+        uint32_t* s = wl_array_add(&states, sizeof(uint32_t));
+        if (s) *s = XDG_TOPLEVEL_STATE_MAXIMIZED;
+    }
+    if (w == g_comp.focused_window) {
+        uint32_t* s = wl_array_add(&states, sizeof(uint32_t));
+        if (s) *s = XDG_TOPLEVEL_STATE_ACTIVATED;
+    }
+
+    xdg_toplevel_send_configure(w->xdg_toplevel_res, (int32_t)content_w, (int32_t)content_h, &states);
+    wl_array_release(&states);
+
+    w->configure_serial = ++g_comp.next_configure_serial;
+    xdg_surface_send_configure(w->xdg_surface_res, w->configure_serial);
+}
+
+/* Nur den Zustand (ACTIVATED/MAXIMIZED) melden, KEINE neue Groesse
+ * vorschlagen: schickt die zuletzt vorgeschlagene Groesse erneut bzw. 0x0
+ * ("Client waehlt selbst"), wenn noch keine Groesse vorgeschlagen wurde.
+ * Gedacht fuer Fokuswechsel, wo der Compositor die Groesse nicht aendert. */
+static void wayland_send_configure_state(crep_window_t* w) {
+    wayland_send_configure(w, w->last_cfg_w, w->last_cfg_h);
+}
+
+/* Fenster-Zustandsaenderung (Groesse, maximiert, Fokus) an den Owner melden --
+ * je nach Transportweg. Ersetzt die direkten vbus_signal_to(WINDOW_CONFIGURE)-
+ * Aufrufe an den Stellen, wo das Fenster ein Wayland-Fenster sein kann. */
+static void window_notify_configure(crep_window_t* w) {
+    if (w->is_wayland) {
+        wayland_send_configure(w, w->content_w, w->content_h);
+        return;
+    }
+}
 
 static void window_apply_maximize(crep_window_t* w) {
     uint32_t wa_x, wa_y, wa_w, wa_h;
@@ -455,12 +407,10 @@ static void window_apply_maximize(crep_window_t* w) {
     w->content_h = wa_h - (uint32_t)(g_comp.display_cfg.ssd_titlebar_h + g_comp.display_cfg.ssd_border_w);
 
     window_resize_shm(w);
-
-    const vbus_display_configure_t conf = {.window_id = w->id, .width = w->content_w, .height = w->content_h};
-    vbus_signal_to(VBUS_IFACE_DISPLAY, VBUS_DISP_WINDOW_CONFIGURE, realm_id, w->owner_realm_id, &conf, sizeof(conf));
+    window_notify_configure(w);
 }
 
-static void window_toggle_maximize(crep_window_t* w) {
+void window_toggle_maximize(crep_window_t* w) {
     if (g_comp.drag_window == w) g_comp.drag_window = NULL;
 
     if (!w->maximized) {
@@ -486,15 +436,12 @@ static void window_toggle_maximize(crep_window_t* w) {
         dirty_expand_window(w); /* restored bounds */
 
         window_resize_shm(w);
-        const vbus_display_configure_t conf = {.window_id = w->id, .width = w->content_w, .height = w->content_h};
-        vbus_signal_to(
-            VBUS_IFACE_DISPLAY, VBUS_DISP_WINDOW_CONFIGURE, realm_id, w->owner_realm_id, &conf, sizeof(conf)
-        );
+        window_notify_configure(w);
     }
     g_comp.needs_present = true;
 }
 
-static void window_minimize(crep_window_t* w) {
+void window_minimize(crep_window_t* w) {
     if (w->minimized) return;
 
     if (g_comp.resize_window == w) g_comp.resize_window = NULL;
@@ -512,10 +459,13 @@ static void window_minimize(crep_window_t* w) {
     dirty_expand_window(w);
     g_comp.needs_present = true;
 
+    if (g_comp.ptr_focus == w) ptr_clear_focus(); /* leave, solange Surface noch lebt */
+
     if (g_comp.focused_window == w) {
-        const vbus_display_window_id_t notif = {.window_id = w->id, ._pad = 0};
-        vbus_signal_to(VBUS_IFACE_DISPLAY, VBUS_DISP_FOCUS_LOST, realm_id, w->owner_realm_id, &notif, sizeof(notif));
         g_comp.focused_window = NULL;
+        if (w->is_wayland) {
+            wayland_send_configure_state(w); /* ohne ACTIVATED */
+        }
         window_focus_next();
     }
 
@@ -552,7 +502,7 @@ static void window_toggle_minimize(crep_window_t* w) {
 }
 
 /* --- Focus Management ----------------------------------------------------- */
-static void window_set_focus(crep_window_t* w) {
+void window_set_focus(crep_window_t* w) {
     if (!w || !w->active) return;
     if (g_comp.desktop_spawned && w->owner_realm_id == g_comp.desktop_realm_id) return;
 
@@ -567,15 +517,25 @@ static void window_set_focus(crep_window_t* w) {
 
     if (prev) {
         dirty_expand_window(prev);
-        const vbus_display_window_id_t notif = {.window_id = prev->id, ._pad = 0};
-        vbus_signal_to(VBUS_IFACE_DISPLAY, VBUS_DISP_FOCUS_LOST, realm_id, prev->owner_realm_id, &notif, sizeof(notif));
+        if (prev->is_wayland) {
+            /* prev ist noch nicht aus focused_window ausgetragen -- Zustand
+             * fuer das Configure erst NACH dem Umschalten berechnen, siehe unten. */
+        } else {
+            const vbus_display_window_id_t notif = {.window_id = prev->id, ._pad = 0};
+            vbus_signal_to(VBUS_IFACE_DISPLAY, VBUS_DISP_FOCUS_LOST, realm_id, prev->owner_realm_id, &notif, sizeof(notif));
+        }
     }
 
     g_comp.focused_window = w;
     dirty_expand_window(w);
 
-    const vbus_display_window_id_t gained = {.window_id = w->id, ._pad = 0};
-    vbus_signal_to(VBUS_IFACE_DISPLAY, VBUS_DISP_FOCUS_GAINED, realm_id, w->owner_realm_id, &gained, sizeof(gained));
+    /* Wayland: ACTIVATED-State haengt an g_comp.focused_window, also erst
+     * nach dem Umschalten Configure senden (prev ohne, w mit ACTIVATED). */
+    if (prev && prev->is_wayland) wayland_send_configure_state(prev);
+
+    if (w->is_wayland) {
+        wayland_send_configure_state(w);
+    }
 
     if (g_comp.desktop_spawned) {
         const vbus_display_window_focused_t focus_notif = {.window_id = w->id, .prev_window_id = prev ? prev->id : 0};
@@ -610,106 +570,15 @@ static void window_focus_next(void) {
     }
 }
 
-/* --- VBUS Message Handlers ------------------------------------------------ */
-static void handle_create_window(const vbus_header_t* hdr, const vbus_display_create_window_t* req) {
-    vbus_display_window_info_t resp = {0};
+/* --- Wayland: Fenster schliessen (gemeinsamer Teardown-Pfad) --------------- */
+/* Analog zu handle_destroy_window() weiter unten, aber ohne vbus-Notifications
+ * an den Owner selbst (der Owner IST der Wayland-Client und wird stattdessen
+ * ueber xdg_toplevel.close bzw. resource_destroy informiert/beendet). */
 
-    if (find_window_by_owner(hdr->sender_id)) {
-        resp.status = -EEXIST;
-        goto send_return;
-    }
-
-    crep_window_t* w = alloc_window_slot();
-    if (!w) {
-        resp.status = -ENOMEM;
-        goto send_return;
-    }
-
-    memset(w, 0, sizeof(*w));
-    w->id = g_comp.next_window_id++;
-    w->flags = req->flags;
-    w->owner_realm_id = hdr->sender_id;
-    w->create_serial = hdr->serial;
-
-    const display_config_t* cfg = &g_comp.display_cfg;
-    w->fullscreen = (req->flags & VBUS_DISP_FLAG_FULLSCREEN) || (!req->width || !req->height);
-
-    if (w->fullscreen) {
-        w->content_w = g_comp.info.width;
-        w->content_h = g_comp.info.height;
-        w->w = w->content_w;
-        w->h = w->content_h;
-        w->x = 0;
-        w->y = 0;
-        w->content_x = 0;
-        w->content_y = 0;
-    } else {
-        w->content_w = req->width;
-        w->content_h = req->height;
-        w->w = req->width + cfg->ssd_border_w * 2;
-        w->h = req->height + cfg->ssd_titlebar_h + cfg->ssd_border_w;
-        w->content_x = cfg->ssd_border_w;
-        w->content_y = cfg->ssd_titlebar_h;
-        w->x = 0;
-        w->y = 0;
-    }
-
-    strlcpy(w->title, req->title, STR_MAX_TITLE);
-    snprintf(w->sync_shm_name, STR_MAX_SHM, "/crep_sync_%u", w->id);
-    snprintf(w->fb_shm_name, STR_MAX_SHM, "/crep_fb_%u", w->id);
-
-    if (window_alloc_shm(w) < 0) {
-        resp.status = -ENOMEM;
-        goto send_return;
-    }
-
-    w->active = true;
-    g_comp.window_count++;
-
-    if (g_comp.desktop_spawned && w->owner_realm_id == g_comp.desktop_realm_id) {
-        memmove(&g_comp.z_order[1], &g_comp.z_order[0], (size_t)g_comp.z_count * sizeof(int));
-        g_comp.z_order[0] = w_slot(w);
-        g_comp.z_count++;
-    } else {
-        z_add(w_slot(w));
-    }
-
-    if (g_comp.desktop_spawned && w->owner_realm_id != g_comp.desktop_realm_id) {
-        vbus_display_window_opened_t notif = {.window_id = w->id};
-        strlcpy(notif.title, w->title, sizeof(notif.title));
-        vbus_signal_to(
-            VBUS_IFACE_DISPLAY, VBUS_DISP_WINDOW_OPENED, realm_id, g_comp.desktop_realm_id, &notif, sizeof(notif)
-        );
-    }
-
-    if (w->owner_realm_id != g_comp.desktop_realm_id) {
-        window_set_focus(w);
-    }
-
-    resp.window_id = w->id;
-    resp.status = 0;
-    resp.width = w->content_w;
-    resp.height = w->content_h;
-    strlcpy(resp.sync_shm, w->sync_shm_name, STR_MAX_SHM);
-    strlcpy(resp.fb_shm, w->fb_shm_name, STR_MAX_SHM);
-
-send_return:;
-    vbus_header_t ret_hdr = {0};
-    ret_hdr.type = VBUS_MSG_RETURN;
-    ret_hdr.serial = vbus_next_serial();
-    ret_hdr.reply_serial = hdr->serial;
-    strcpy(ret_hdr.interface, VBUS_IFACE_DISPLAY);
-    strcpy(ret_hdr.member, VBUS_DISP_WINDOW_CREATED);
-    vbus_emit_raw(&ret_hdr, &resp, sizeof(resp));
-}
-
-static void handle_destroy_window(const vbus_header_t* hdr, const vbus_display_window_id_t* req) {
-    (void)hdr;
-    crep_window_t* w = find_window_by_id(req->window_id);
-    if (!w) return;
-
-    dirty_expand_window(w); /* capture the area the window occupied before removal */
+void wayland_window_teardown(crep_window_t* w) {
+    dirty_expand_window(w);
     window_free_shm(w);
+    ptr_window_gone(w); /* kein leave: die Surface stirbt ohnehin mit */
 
     if (g_comp.resize_window == w) g_comp.resize_window = NULL;
     if (g_comp.drag_window == w) g_comp.drag_window = NULL;
@@ -730,68 +599,11 @@ static void handle_destroy_window(const vbus_header_t* hdr, const vbus_display_w
     g_comp.window_count--;
     g_comp.needs_present = true;
 
-    const vbus_display_window_id_t closed = {.window_id = req->window_id, ._pad = 0};
-    vbus_signal_to(VBUS_IFACE_DISPLAY, VBUS_DISP_WINDOW_CLOSED, realm_id, w->owner_realm_id, &closed, sizeof(closed));
-
-    if (g_comp.desktop_spawned && w->owner_realm_id != g_comp.desktop_realm_id) {
-        vbus_signal_to(
-            VBUS_IFACE_DISPLAY, VBUS_DISP_WINDOW_CLOSED, realm_id, g_comp.desktop_realm_id, &closed, sizeof(closed)
-        );
-    }
-
     if (was_focused) window_focus_next();
 }
 
-static int drain_vbus(void) {
-    int processed = 0;
-    for (;;) {
-        vbus_header_t hdr;
-        vbus_payload_t payload;
 
-        if (vbus_recv(&hdr, &payload, sizeof(payload)) <= 0) break;
-        if (strcmp(hdr.interface, VBUS_IFACE_DISPLAY) != 0) continue;
 
-        if (hdr.type == VBUS_MSG_CALL && strcmp(hdr.member, VBUS_DISP_CREATE_WINDOW) == 0) {
-            handle_create_window(&hdr, &payload.create_window);
-        } else if (hdr.type == VBUS_MSG_SIGNAL && strcmp(hdr.member, VBUS_DISP_WINDOW_COMMIT) == 0) {
-            crep_window_t* w = find_window_by_id(payload.commit.window_id);
-            if (w) {
-                __atomic_store_n(&w->sync->dirty, 0u, __ATOMIC_RELAXED);
-                w->dirty = true;
-                dirty_expand_window(w);
-                g_comp.needs_present = true;
-            }
-        } else if (hdr.type == VBUS_MSG_CALL && strcmp(hdr.member, VBUS_DISP_DESTROY_WINDOW) == 0) {
-            handle_destroy_window(&hdr, &payload.destroy_window);
-        } else if (hdr.type == VBUS_MSG_SIGNAL && strcmp(hdr.member, VBUS_DISP_WINDOW_ACTIVATE) == 0) {
-            crep_window_t* w = find_window_by_id(payload.activate.window_id);
-            if (w) window_toggle_minimize(w);
-        } else if (hdr.type == VBUS_MSG_SIGNAL && strcmp(hdr.member, VBUS_DISP_SET_STRUT) == 0) {
-            const vbus_display_set_strut_t* s = &payload.set_strut;
-            switch (s->edge) {
-            case CREP_STRUT_TOP:
-                g_comp.struts.top = s->size;
-                break;
-            case CREP_STRUT_BOTTOM:
-                g_comp.struts.bottom = s->size;
-                break;
-            case CREP_STRUT_LEFT:
-                g_comp.struts.left = s->size;
-                break;
-            case CREP_STRUT_RIGHT:
-                g_comp.struts.right = s->size;
-                break;
-            }
-            for (int i = 0; i < MAX_WINDOWS; i++) {
-                if (g_comp.windows[i].active && g_comp.windows[i].maximized) window_apply_maximize(&g_comp.windows[i]);
-            }
-            dirty_expand(0, 0, (int32_t)g_comp.info.width, (int32_t)g_comp.info.height);
-            g_comp.needs_present = true;
-        }
-        processed++;
-    }
-    return processed;
-}
 
 /* --- Dirty Region Helpers ------------------------------------------------- */
 static void dirty_reset(void) {
@@ -812,7 +624,7 @@ static void dirty_expand(int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
     if (y1 > g_comp.dirty_region.y1) g_comp.dirty_region.y1 = y1;
 }
 
-static void dirty_expand_window(const crep_window_t* w) {
+void dirty_expand_window(const crep_window_t* w) {
     if (!w || !w->active) return;
     dirty_expand((int32_t)w->x, (int32_t)w->y,
                  (int32_t)(w->x + w->w), (int32_t)(w->y + w->h));
@@ -1130,7 +942,7 @@ static void composite_frame(void) {
 }
 
 /* --- Input Handling ------------------------------------------------------- */
-static crep_window_t* find_window_at(int32_t x, int32_t y) {
+crep_window_t* find_window_at(int32_t x, int32_t y) {
     for (int zi = g_comp.z_count - 1; zi >= 0; zi--) {
         crep_window_t* w = &g_comp.windows[g_comp.z_order[zi]];
         if (!w->active || !w->pixels || w->minimized) continue;
@@ -1145,7 +957,7 @@ static bool is_titlebar_hit(const crep_window_t* w, int32_t x, int32_t y) {
         y < (int32_t)(w->y + w->content_y);
 }
 
-static resize_edge_t hit_test_resize_edge(const crep_window_t* w, int32_t mx, int32_t my) {
+resize_edge_t hit_test_resize_edge(const crep_window_t* w, int32_t mx, int32_t my) {
     if (w->fullscreen || w->maximized) return RESIZE_NONE;
 
     const int32_t wx = (int32_t)w->x;
@@ -1198,16 +1010,7 @@ static void window_apply_resize(
         w->content_w = new_cw;
         w->content_h = new_ch;
         window_resize_shm(w);
-
-        const vbus_display_configure_t conf = {
-            .window_id = w->id,
-            .width = w->content_w,
-            .height = w->content_h,
-        };
-        vbus_signal_to(
-            VBUS_IFACE_DISPLAY, VBUS_DISP_WINDOW_CONFIGURE,
-            realm_id, w->owner_realm_id, &conf, sizeof(conf)
-        );
+        window_notify_configure(w);
     }
 
     g_comp.needs_present = true;
@@ -1371,6 +1174,7 @@ static bool process_mouse(void) {
 
         if (ev->type == MICE_EVENT_MOVE) {
             handle_mouse_move(ev, &coalesced_win, &coalesced_payload);
+            seat_pointer_motion(); /* Wayland: enter/leave/motion an den Client */
             moved = true;
             g_comp.last_buttons = ev->buttons;
             continue;
@@ -1379,6 +1183,13 @@ static bool process_mouse(void) {
         const uint8_t pressed = (uint8_t)(ev->buttons & ~g_comp.last_buttons);
         const uint8_t released = (uint8_t)(~ev->buttons & g_comp.last_buttons);
         g_comp.last_buttons = ev->buttons;
+
+        /* --- Wayland-Pointer: Releases ----------------------------------------
+         * Ein Release muss den Client IMMER erreichen, wenn er den zugehoerigen
+         * Press gesehen hat -- auch wenn die Schleife unten per `continue`
+         * abbricht (SSD-Grab-Ende). seat_pointer_buttons() filtert selbst:
+         * es reicht nur Releases weiter, deren Press der Client bekam. */
+        if (released) seat_pointer_buttons(released, ev->buttons);
 
         if ((pressed & 1) && !g_comp.drag_window && !g_comp.resize_window) {
             crep_window_t* w = find_window_at(g_comp.mx, g_comp.my);
@@ -1428,8 +1239,13 @@ static bool process_mouse(void) {
             if (w_under == w && is_titlebar_hit(w, g_comp.mx, g_comp.my) &&
                 hit_test_titlebar_buttons(w, g_comp.mx, g_comp.my) == btn) {
                 if (btn == BTN_CLOSE_IDX) {
-                    vbus_display_window_id_t req = {w->id, 0};
-                    handle_destroy_window(NULL, &req);
+                    if (w->is_wayland) {
+                        /* Hoefliche Anfrage: der Client entscheidet (z.B. "Ungespeicherte
+                         * Aenderungen?") und zerstoert danach selbst seine Objekte, was
+                         * ueber die resource_destroy-Callbacks in wayland_window_teardown()
+                         * muendet. */
+                        if (w->xdg_toplevel_res) xdg_toplevel_send_close(w->xdg_toplevel_res);
+                    }
                 } else if (btn == BTN_MAXIMIZE_IDX)
                     window_toggle_maximize(w);
                 else if (btn == BTN_MINIMIZE_IDX)
@@ -1448,8 +1264,13 @@ static bool process_mouse(void) {
             continue;
         }
 
+        /* --- Wayland-Pointer: Presses -----------------------------------------
+         * Wir sind hier NACH den SSD-Zweigen (Resize/Titelleiste/Buttons haben
+         * per `continue` abgebrochen), d.h. der Press gehoert dem Client. */
+        if (pressed) seat_pointer_buttons(pressed, ev->buttons);
+
         const crep_window_t* target = find_window_at(g_comp.mx, g_comp.my);
-        if (target) {
+        if (target && !target->is_wayland) { /* vbus-Fenster: alter Weg; Wayland-Fenster: oben erledigt */
             const int32_t lx = g_comp.mx - (int32_t)(target->x + target->content_x);
             const int32_t ly = g_comp.my - (int32_t)(target->y + target->content_y);
             if (lx >= 0 && ly >= 0 && (uint32_t)lx < target->content_w && (uint32_t)ly < target->content_h) {
@@ -1488,7 +1309,7 @@ static bool process_mouse(void) {
 }
 
 /* --- Timing & Setup ------------------------------------------------------- */
-static inline int64_t now_ns(void) {
+inline int64_t now_ns(void) {
     timespec_t ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000000000LL + ts.tv_nsec;
@@ -1625,6 +1446,50 @@ int main(int argc, char* argv[]) {
 
     CHRONOS_CP_PHASE("display", "vbus_subscribed");
 
+    /* --- Wayland-Setup -----------------------------------------------
+     * Laeuft parallel zum bestehenden vbus-Pfad waehrend der Migration:
+     * beide Transportwege fuettern dieselbe crep_window_t-Verwaltung. */
+    g_comp.wl_display = wl_display_create();
+    if (!g_comp.wl_display) {
+        printf("wl_display_create() failed\n");
+        return 1;
+    }
+
+    if (wl_display_init_shm(g_comp.wl_display) < 0) {
+        printf("wl_display_init_shm() failed\n");
+        return 1;
+    }
+
+    if (!wl_global_create(g_comp.wl_display, &wl_compositor_interface, 4, NULL, wl_compositor_bind)) {
+        printf("wl_global_create(wl_compositor) failed\n");
+        return 1;
+    }
+
+    if (!wl_global_create(g_comp.wl_display, &xdg_wm_base_interface, 3, NULL, xdg_wm_base_bind)) {
+        printf("wl_global_create(xdg_wm_base) failed\n");
+        return 1;
+    }
+
+    if (!wl_global_create(g_comp.wl_display, &wl_seat_interface, SEAT_VERSION, NULL, wl_seat_bind)) {
+        printf("wl_global_create(wl_seat) failed\n");
+        return 1;
+    }
+
+    if (!wl_global_create(g_comp.wl_display, &wl_output_interface, OUTPUT_VERSION, NULL, wl_output_bind)) {
+        printf("wl_global_create(wl_output) failed\n");
+        return 1;
+    }
+
+    if (wl_display_add_socket(g_comp.wl_display, WAYLAND_SOCKET_PATH) != 0) {
+        printf("wl_display_add_socket() failed\n");
+        return 1;
+    }
+
+    g_comp.wl_loop = wl_display_get_event_loop(g_comp.wl_display);
+    g_comp.wl_fd = wl_event_loop_get_fd(g_comp.wl_loop);
+
+    CHRONOS_CP_PHASE("display", "wayland_ready");
+
     g_comp.mx = g_comp.info.width / 2;
     g_comp.my = g_comp.info.height / 2;
     g_comp.prev_mx = g_comp.mx;
@@ -1654,7 +1519,22 @@ int main(int argc, char* argv[]) {
         .bg_realm = 1
     };
 
-    const int64_t rid =
+#define TEST_CLIENT_BINARY "/bin/wayland-egl-client"
+    const char* argv1[] = { TEST_CLIENT_BINARY, NULL };
+    const char* envp[] = {
+        "PATH=/bin",
+        "WAYLAND_DISPLAY=" WAYLAND_SOCKET_PATH,
+        NULL
+    };
+
+    const int64_t rid = spawn_realm(TEST_CLIENT_BINARY, (char**)argv1, (char**)envp, NULL);
+    if (rid <= 0) {
+        printf("[server] spawn_realm() fehlgeschlagen für Test-Client\n");
+    } else {
+        printf("[server] Test-Client gespawnt (realm_id=%lld)\n", (long long)rid);
+    }
+
+  /*  const int64_t rid =
         spawn_realm(
             g_comp.display_cfg.compositor_desktop_binary,
             (char**)desktop_argv,
@@ -1670,7 +1550,7 @@ int main(int argc, char* argv[]) {
         printf("Spawning desktop failed\n");
 
         CHRONOS_CP_PHASE("display", "desktop_spawn_failed");
-    }
+    }*/
 
     //ves_mutex_init(&g_mouse_ring.mtx);
 
@@ -1709,8 +1589,18 @@ int main(int argc, char* argv[]) {
             g_comp.prev_my = g_comp.my;
             g_comp.needs_present = true;
         }
-        drain_vbus();
+
+        wl_event_loop_dispatch(g_comp.wl_loop, 0);
+
+        xdg_wm_base_ping_tick();
+
+        seat_pointer_refocus();
+
         if (g_comp.needs_present) composite_frame();
+
+        wayland_send_frame_callbacks();
+
+        wl_display_flush_clients(g_comp.wl_display);
 
         sleep_ns(next_frame - now_ns());
         next_frame += frame_ns;
